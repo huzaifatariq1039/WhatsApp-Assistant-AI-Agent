@@ -1,0 +1,559 @@
+{
+  "name": "Secure WhatsApp Assistant - WebCorps",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-incoming",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "node_webhook_incoming",
+      "name": "WhatsApp Incoming Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 400],
+      "webhookId": "whatsapp-incoming-secure"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════\n// NODE: Extract & Sanitize Message\n// Purpose: Parse Evolution API payload, strip PII from logs\n// ═══════════════════════════════════════════════════\n\nconst body = $input.first().json.body || $input.first().json;\n\n// --- Evolution API payload structure ---\nconst event = body.event || '';\nconst instance = body.instance || '';\n\n// Support both Evolution API v1 and v2 payload shapes\nlet senderId = '';\nlet messageText = '';\nlet messageId = '';\nlet pushName = '';\n\nif (body.data && body.data.key) {\n  // Evolution API v2 format\n  senderId = body.data.key.remoteJid || '';\n  messageId = body.data.key.id || '';\n  pushName = body.data.pushName || '';\n  messageText = body.data.message?.conversation \n    || body.data.message?.extendedTextMessage?.text \n    || body.data.message?.imageMessage?.caption\n    || '';\n} else if (body.messages && body.messages[0]) {\n  // Evolution API v1 format\n  const msg = body.messages[0];\n  senderId = msg.key?.remoteJid || '';\n  messageId = msg.key?.id || '';\n  pushName = msg.pushName || '';\n  messageText = msg.message?.conversation \n    || msg.message?.extendedTextMessage?.text\n    || '';\n}\n\n// Normalize sender ID (strip @s.whatsapp.net suffix for comparison)\nconst senderPhone = senderId.replace('@s.whatsapp.net', '').replace('@g.us', '');\n\n// --- PII Sanitizer for safe logging (before any external call) ---\nconst sanitizedText = messageText\n  .replace(/\\b[\\w._%+-]+@[\\w.-]+\\.[A-Z]{2,}\\b/gi, '[EMAIL_REDACTED]')\n  .replace(/\\b(\\+?\\d[\\d\\s\\-().]{7,}\\d)\\b/g, '[PHONE_REDACTED]')\n  .replace(/\\b\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}\\b/g, '[CARD_REDACTED]');\n\n// Ignore messages from self (bot's own number) or group messages (for now)\nconst isFromMe = body.data?.key?.fromMe || false;\nconst isGroup = senderId.includes('@g.us');\n\nif (isFromMe || isGroup || !messageText.trim()) {\n  // Return a stop signal\n  return [{ json: { __stop: true, reason: 'self_or_group_or_empty' } }];\n}\n\nreturn [{\n  json: {\n    __stop: false,\n    senderId,\n    senderPhone,\n    messageText,          // original - used for AI\n    sanitizedText,        // sanitized - used for logging\n    messageId,\n    pushName,\n    instance,\n    event,\n    receivedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node_extract_sanitize",
+      "name": "Extract & Sanitize Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "stop_check",
+              "leftValue": "={{ $json.__stop }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node_if_stop",
+      "name": "Should Process?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [640, 400]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/{{ $vars.GOOGLE_SHEET_ID }}/values/Whitelist!A:D",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node_fetch_whitelist",
+      "name": "Fetch Whitelist from Google Sheets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 300],
+      "credentials": {
+        "oAuth2Api": {
+          "id": "google_oauth_cred",
+          "name": "Google OAuth2"
+        }
+      },
+      "notes": "Sheet columns: A=Phone, B=Name, C=Tag(Client|Personal), D=Status(Active|Blocked)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════\n// NODE: Gatekeeper - Whitelist Check\n// Purpose: Determine if sender is authorized and their type\n// ═══════════════════════════════════════════════════\n\nconst incoming = $('Extract & Sanitize Message').first().json;\nconst sheetData = $input.first().json;\n\nconst senderPhone = incoming.senderPhone.trim();\nconst rows = sheetData.values || [];\n\n// Skip header row (row 0 = headers: Phone, Name, Tag, Status)\nlet authorized = false;\nlet contactName = '';\nlet contactTag = 'Personal'; // default\nlet contactStatus = 'Active';\n\nfor (let i = 1; i < rows.length; i++) {\n  const row = rows[i];\n  const sheetPhone = (row[0] || '').toString().trim().replace(/[^0-9+]/g, '');\n  const normalizedSender = senderPhone.replace(/[^0-9+]/g, '');\n  \n  if (sheetPhone === normalizedSender || sheetPhone === '+' + normalizedSender) {\n    contactStatus = (row[3] || 'Active').trim();\n    if (contactStatus.toLowerCase() === 'active') {\n      authorized = true;\n      contactName = (row[1] || incoming.pushName || 'Contact').trim();\n      contactTag = (row[2] || 'Personal').trim(); // 'Client' or 'Personal'\n    }\n    break;\n  }\n}\n\nreturn [{\n  json: {\n    ...incoming,\n    authorized,\n    contactName,\n    contactTag,\n    contactStatus\n  }\n}];"
+      },
+      "id": "node_gatekeeper",
+      "name": "Gatekeeper Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "conditions": [
+            {
+              "id": "auth_check",
+              "leftValue": "={{ $json.authorized }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node_if_authorized",
+      "name": "Is Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $vars.GOOGLE_SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Phone": "={{ $json.senderPhone }}",
+            "Name": "={{ $json.pushName }}",
+            "Message_Sanitized": "={{ $json.sanitizedText }}",
+            "Timestamp": "={{ $json.receivedAt }}",
+            "Status": "Unreviewed"
+          }
+        },
+        "options": {}
+      },
+      "id": "node_log_unauthorized",
+      "name": "Log to Leads Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1540, 480],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "google_sheets_cred",
+          "name": "Google Sheets OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════\n// NODE: Build System Prompt\n// Purpose: Dynamic personality based on contact tag\n// ═══════════════════════════════════════════════════\n\nconst data = $input.first().json;\nconst tag = data.contactTag || 'Personal';\nconst name = data.contactName || 'there';\n\nlet systemPrompt = '';\n\nif (tag.toLowerCase() === 'client') {\n  systemPrompt = `You are a professional assistant for WebCorps, a digital agency. You are responding to ${name}, a valued client.\n\nGuidelines:\n- Maintain a formal, polished, and solution-oriented tone\n- Use *bold text* for important terms and key points\n- Use bullet points where listing multiple items for clarity\n- Keep responses concise but complete — never leave a question unanswered\n- Always end with an offer to assist further if needed\n- Do NOT mention that you are an AI unless directly asked\n- Response language: match the language the client uses (Urdu/English)`;\n} else {\n  systemPrompt = `You are a helpful personal assistant. You are chatting with ${name}.\n\nGuidelines:\n- Be casual, friendly, and brief — like texting a smart friend\n- Use bullet points only when listing 3+ items\n- Skip unnecessary formalities\n- Match the energy of the message (short question = short answer)\n- Do NOT mention that you are an AI unless directly asked\n- Response language: match the language used (Urdu/English/Roman Urdu)`;\n}\n\n// Choose model based on message complexity\nconst msgLength = (data.messageText || '').length;\nconst wordCount = (data.messageText || '').split(' ').length;\nconst isComplex = wordCount > 20 || data.messageText.includes('?') && wordCount > 10;\n\n// Use Scout for quick/short replies, 70B for complex queries\nconst selectedModel = isComplex \n  ? 'llama-3.3-70b-versatile' \n  : 'meta-llama/llama-4-scout-17b-16e-instruct';\n\nreturn [{\n  json: {\n    ...data,\n    systemPrompt,\n    selectedModel,\n    isComplex\n  }\n}];"
+      },
+      "id": "node_build_prompt",
+      "name": "Build System Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 280]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://' + $vars.SUPABASE_URL + '/rest/v1/conversation_memory?phone=eq.' + $json.senderPhone + '&order=created_at.desc&limit=10' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $vars.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $vars.SUPABASE_ANON_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_fetch_memory",
+      "name": "Fetch Conversation Memory",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1760, 280],
+      "notes": "Fetches last 10 turns from Supabase. Table: conversation_memory (id, phone, role, content, created_at)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════\n// NODE: Assemble Messages Array\n// Purpose: Build the full messages array for Groq API\n// ═══════════════════════════════════════════════════\n\nconst promptData = $('Build System Prompt').first().json;\nconst memoryRaw = $input.first().json;\n\n// Memory rows come back newest-first from Supabase, so reverse for chronological order\nconst memoryRows = Array.isArray(memoryRaw) ? memoryRaw.reverse() : [];\n\nconst messages = [];\n\n// Add historical turns (max 10 turns = 20 messages, but we fetched 10 rows)\nfor (const row of memoryRows) {\n  messages.push({\n    role: row.role,   // 'user' or 'assistant'\n    content: row.content\n  });\n}\n\n// Add the current user message\nmessages.push({\n  role: 'user',\n  content: promptData.messageText\n});\n\nreturn [{\n  json: {\n    ...promptData,\n    messages,\n    memoryCount: memoryRows.length\n  }\n}];"
+      },
+      "id": "node_assemble_messages",
+      "name": "Assemble Messages Array",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $vars.GROQ_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"{{ $json.selectedModel }}\",\n  \"messages\": [\n    { \"role\": \"system\", \"content\": {{ JSON.stringify($json.systemPrompt) }} }\n  ].concat({{ JSON.stringify($json.messages) }}),\n  \"max_tokens\": {{ $json.isComplex ? 800 : 300 }},\n  \"temperature\": 0.7,\n  \"stream\": false\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "node_groq_call",
+      "name": "Groq AI Inference",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, 280],
+      "notes": "Direct Groq call — zero third-party wrappers. Pipeline: WhatsApp → n8n → Groq → WhatsApp"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════\n// NODE: Rate Limit Handler\n// Purpose: Check Groq headers for rate limits, set wait flag\n// ═══════════════════════════════════════════════════\n\nconst response = $input.first();\nconst statusCode = response.json.statusCode || 200;\nconst headers = response.json.headers || {};\nconst body = response.json.body || response.json;\n\n// Groq rate limit headers\nconst remainingRequests = parseInt(headers['x-ratelimit-remaining-requests'] || '100');\nconst remainingTokens = parseInt(headers['x-ratelimit-remaining-tokens'] || '100000');\nconst resetRequestsMs = parseInt((headers['x-ratelimit-reset-requests'] || '0s').replace('s','')) * 1000;\nconst resetTokensMs = parseInt((headers['x-ratelimit-reset-tokens'] || '0s').replace('s','')) * 1000;\n\nlet rateLimited = false;\nlet waitMs = 0;\nlet aiReply = '';\n\nif (statusCode === 429) {\n  // Rate limited — calculate wait time\n  rateLimited = true;\n  waitMs = Math.max(resetRequestsMs, resetTokensMs, 60000); // min 60s wait\n  aiReply = ''; // will retry after wait\n} else if (statusCode === 200 || (body.choices && body.choices[0])) {\n  // Success\n  aiReply = body.choices?.[0]?.message?.content || body.body?.choices?.[0]?.message?.content || '';\n  \n  // Proactive throttle: if < 5 requests remaining, schedule a short pause\n  if (remainingRequests < 5 || remainingTokens < 5000) {\n    rateLimited = true;\n    waitMs = Math.max(resetRequestsMs, resetTokensMs, 10000);\n  }\n} else {\n  aiReply = \"I'm having trouble processing that right now. Please try again in a moment.\";\n}\n\n// Get context from upstream\nconst upstream = $('Assemble Messages Array').first().json;\n\nreturn [{\n  json: {\n    ...upstream,\n    aiReply,\n    rateLimited,\n    waitMs,\n    statusCode,\n    remainingRequests,\n    remainingTokens\n  }\n}];"
+      },
+      "id": "node_rate_limit_handler",
+      "name": "Rate Limit Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "conditions": [
+            {
+              "id": "rate_limited_check",
+              "leftValue": "={{ $json.rateLimited }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node_if_rate_limited",
+      "name": "Rate Limited?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2640, 280]
+    },
+    {
+      "parameters": {
+        "amount": "={{ Math.ceil($json.waitMs / 1000) }}",
+        "unit": "seconds"
+      },
+      "id": "node_wait_throttle",
+      "name": "Throttle Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [2860, 200],
+      "notes": "Waits based on Groq reset header value before retrying"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $vars.GROQ_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"{{ $json.selectedModel }}\",\n  \"messages\": [\n    { \"role\": \"system\", \"content\": {{ JSON.stringify($json.systemPrompt) }} }\n  ].concat({{ JSON.stringify($json.messages) }}),\n  \"max_tokens\": {{ $json.isComplex ? 800 : 300 }},\n  \"temperature\": 0.7,\n  \"stream\": false\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node_groq_retry",
+      "name": "Groq Retry After Throttle",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3080, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════\n// NODE: Merge AI Reply\n// Purpose: Unify reply from first attempt or retry\n// ═══════════════════════════════════════════════════\n\nlet aiReply = '';\nlet upstream = {};\n\n// Check if we came from retry path or direct path\ntry {\n  const retryData = $('Groq Retry After Throttle').first();\n  if (retryData && retryData.json) {\n    const body = retryData.json;\n    aiReply = body.choices?.[0]?.message?.content || '';\n    upstream = $('Rate Limit Handler').first().json;\n  }\n} catch(e) {\n  // Came from direct (non-rate-limited) path\n  upstream = $('Rate Limit Handler').first().json;\n  aiReply = upstream.aiReply;\n}\n\nif (!aiReply) {\n  aiReply = \"Sorry, I couldn't get a response right now. Please try again in a moment. 🙏\";\n}\n\nreturn [{\n  json: {\n    ...upstream,\n    aiReply\n  }\n}];"
+      },
+      "id": "node_merge_reply",
+      "name": "Merge AI Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3080, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'http://' + $vars.EVOLUTION_API_HOST + '/message/sendText/' + $vars.EVOLUTION_INSTANCE }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $vars.EVOLUTION_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"number\": \"{{ $json.senderPhone }}\",\n  \"text\": {{ JSON.stringify($json.aiReply) }},\n  \"options\": {\n    \"delay\": 1200,\n    \"presence\": \"composing\",\n    \"linkPreview\": false\n  }\n}",
+        "options": {}
+      },
+      "id": "node_send_reply_evolution",
+      "name": "Send Reply via Evolution API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3300, 380],
+      "notes": "Primary: Evolution API (self-hosted, zero per-conversation cost)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://' + $vars.SUPABASE_URL + '/rest/v1/conversation_memory' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $vars.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $vars.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=[\n  {\n    \"phone\": \"{{ $('Merge AI Reply').first().json.senderPhone }}\",\n    \"role\": \"user\",\n    \"content\": {{ JSON.stringify($('Merge AI Reply').first().json.messageText) }},\n    \"created_at\": \"{{ $('Merge AI Reply').first().json.receivedAt }}\"\n  },\n  {\n    \"phone\": \"{{ $('Merge AI Reply').first().json.senderPhone }}\",\n    \"role\": \"assistant\",\n    \"content\": {{ JSON.stringify($('Merge AI Reply').first().json.aiReply) }},\n    \"created_at\": \"{{ new Date().toISOString() }}\"\n  }\n]",
+        "options": {}
+      },
+      "id": "node_save_memory",
+      "name": "Save Turn to Memory",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3520, 380],
+      "notes": "Saves user + assistant turns to Supabase for 10-turn context window"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════\n// NODE: Prune Old Memory\n// Purpose: Keep only last 10 turns per contact (20 rows)\n// ═══════════════════════════════════════════════════\n\n// This runs a Supabase RPC or delete query to trim old rows\n// We'll use a simple approach: delete rows older than the 20th newest per phone\n\nconst phone = $('Merge AI Reply').first().json.senderPhone;\n\n// We return the delete query parameters for the next HTTP node\nreturn [{\n  json: {\n    phone,\n    pruneQuery: `phone=eq.${phone}&id=not.in.(select id from conversation_memory where phone=eq.${phone} order by created_at desc limit 20)`\n  }\n}];"
+      },
+      "id": "node_prune_memory",
+      "name": "Prune Old Memory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3740, 380]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ 'https://' + $vars.SUPABASE_URL + '/rest/v1/conversation_memory?' + $json.pruneQuery }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $vars.SUPABASE_ANON_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $vars.SUPABASE_ANON_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_prune_execute",
+      "name": "Execute Memory Prune",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3960, 380]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\" }",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "node_webhook_response",
+      "name": "Webhook Response 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [4180, 380]
+    }
+  ],
+  "connections": {
+    "WhatsApp Incoming Webhook": {
+      "main": [
+        [{ "node": "Extract & Sanitize Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extract & Sanitize Message": {
+      "main": [
+        [{ "node": "Should Process?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Should Process?": {
+      "main": [
+        [{ "node": "Fetch Whitelist from Google Sheets", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Fetch Whitelist from Google Sheets": {
+      "main": [
+        [{ "node": "Gatekeeper Check", "type": "main", "index": 0 }]
+      ]
+    },
+    "Gatekeeper Check": {
+      "main": [
+        [{ "node": "Is Authorized?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Authorized?": {
+      "main": [
+        [{ "node": "Build System Prompt", "type": "main", "index": 0 }],
+        [{ "node": "Log to Leads Sheet", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build System Prompt": {
+      "main": [
+        [{ "node": "Fetch Conversation Memory", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Conversation Memory": {
+      "main": [
+        [{ "node": "Assemble Messages Array", "type": "main", "index": 0 }]
+      ]
+    },
+    "Assemble Messages Array": {
+      "main": [
+        [{ "node": "Groq AI Inference", "type": "main", "index": 0 }]
+      ]
+    },
+    "Groq AI Inference": {
+      "main": [
+        [{ "node": "Rate Limit Handler", "type": "main", "index": 0 }]
+      ]
+    },
+    "Rate Limit Handler": {
+      "main": [
+        [{ "node": "Rate Limited?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Rate Limited?": {
+      "main": [
+        [{ "node": "Throttle Wait", "type": "main", "index": 0 }],
+        [{ "node": "Merge AI Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Throttle Wait": {
+      "main": [
+        [{ "node": "Groq Retry After Throttle", "type": "main", "index": 0 }]
+      ]
+    },
+    "Groq Retry After Throttle": {
+      "main": [
+        [{ "node": "Merge AI Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Merge AI Reply": {
+      "main": [
+        [{ "node": "Send Reply via Evolution API", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Reply via Evolution API": {
+      "main": [
+        [{ "node": "Save Turn to Memory", "type": "main", "index": 0 }]
+      ]
+    },
+    "Save Turn to Memory": {
+      "main": [
+        [{ "node": "Prune Old Memory", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prune Old Memory": {
+      "main": [
+        [{ "node": "Execute Memory Prune", "type": "main", "index": 0 }]
+      ]
+    },
+    "Execute Memory Prune": {
+      "main": [
+        [{ "node": "Webhook Response 200", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["whatsapp", "ai-assistant", "webcorps", "secure"],
+  "triggerCount": 1,
+  "updatedAt": "2026-04-04T00:00:00.000Z",
+  "versionId": "1.0.0"
+}
